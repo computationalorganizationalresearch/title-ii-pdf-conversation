@@ -513,6 +513,24 @@ def _normalize_heading_level_to_hn(level: int) -> str:
     return f"H{min(3, max(1, int(level)))}"
 
 
+def _ensure_minimum_h1_heading(
+    inferred_headings: List[Dict[str, object]],
+    fallback_title: str,
+) -> List[Dict[str, object]]:
+    """
+    Guarantee at least one heading for downstream PDF structure tagging.
+    If heading inference fails completely, synthesize a single H1 on page 1
+    using the resolved document title.
+    """
+    if inferred_headings:
+        return inferred_headings
+
+    fallback_text = re.sub(r"\s+", " ", fallback_title or "").strip()
+    if not fallback_text:
+        fallback_text = "Document"
+    return [{"level": 1, "text": fallback_text, "page": 1}]
+
+
 def _apply_pdf_headings_as_bookmarks(pdf_in: Path, pdf_out: Path, headings: List[Dict[str, object]]) -> None:
     """
     Add inferred headings as PDF bookmarks (table-of-contents/navigation).
@@ -1012,6 +1030,8 @@ def convert_pdf(
 
     # Normalize hierarchy so headings start at H1 and preserve relative depth.
     inferred_headings = _deepseek_relevel_headings(inferred_headings)
+    # Ensure exported/tagged output always includes at least one H1 heading.
+    inferred_headings = _ensure_minimum_h1_heading(inferred_headings, resolved_title)
     headings_by_page: Dict[int, List[Dict[str, object]]] = {}
     for heading in inferred_headings:
         page_no = int(heading.get("page", 1))
