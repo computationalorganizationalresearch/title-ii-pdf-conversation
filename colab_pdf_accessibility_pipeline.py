@@ -292,6 +292,48 @@ def _infer_page_headings(page_text: str, page_number: int) -> List[Dict[str, obj
     return _heuristic_heading_guess(page_text, page_number)
 
 
+def _is_ocr_placeholder(text: str) -> bool:
+    """Detect non-content placeholder text produced when OCR is unavailable."""
+    lowered = text.lower()
+    return (
+        "local deepseek ocr unavailable on page" in lowered
+        or "ocr backend '" in lowered
+    )
+
+
+def _extract_page_texts(pdf_path: Path) -> List[str]:
+    """Extract direct page text from a PDF (used as fallback for heading/tag inference)."""
+    doc = fitz.open(pdf_path.as_posix())
+    try:
+        return [page.get_text("text").strip() for page in doc]
+    finally:
+        doc.close()
+
+
+def _merge_inference_texts(ocr_texts: List[str], native_texts: List[str]) -> List[str]:
+    """
+    Prefer OCR page text, but fallback to direct PDF-extracted text when OCR
+    yielded placeholders or empty output.
+    """
+    merged: List[str] = []
+    for idx, native in enumerate(native_texts):
+        ocr = ocr_texts[idx] if idx < len(ocr_texts) else ""
+        if ocr.strip() and not _is_ocr_placeholder(ocr):
+            merged.append(ocr)
+        else:
+            merged.append(native.strip())
+    return merged
+
+
+def _normalize_heading_level_to_hn(level: int) -> str:
+    """
+    Normalize inferred headings to H2 to mirror Acrobat's manual
+    "set tag type to <H2>" workflow for section headings.
+    """
+    _ = level
+    return "H2"
+
+
 def _apply_pdf_headings_as_bookmarks(pdf_in: Path, pdf_out: Path, headings: List[Dict[str, object]]) -> None:
     """
     Add inferred headings as PDF bookmarks (table-of-contents/navigation).
@@ -401,6 +443,7 @@ def _add_minimal_structure_tags(
     pdf_in: Path,
     pdf_out: Path,
     page_tag_guesses: Optional[List[List[str]]] = None,
+    page_headings: Optional[List[List[Dict[str, object]]]] = None,
 ) -> None:
     """
     Add a minimal logical structure tree so the exported PDF is tagged.
@@ -459,8 +502,8 @@ def _add_minimal_structure_tags(
             if page_tag_guesses and page_index < len(page_tag_guesses):
                 guessed_tags = page_tag_guesses[page_index]
 
+            children = pikepdf.Array()
             if guessed_tags:
-                children = pikepdf.Array()
                 for tag in guessed_tags:
                     children.append(
                         pdf.make_indirect(
@@ -475,6 +518,33 @@ def _add_minimal_structure_tags(
                             )
                         )
                     )
+
+            heading_items: List[Dict[str, object]] = []
+            if page_headings and page_index < len(page_headings):
+                heading_items = page_headings[page_index]
+
+            for heading in heading_items:
+                heading_text = str(heading.get("text", "")).strip()
+                if not heading_text:
+                    continue
+                heading_tag = _normalize_heading_level_to_hn(int(heading.get("level", 2)))
+                children.append(
+                    pdf.make_indirect(
+                        pikepdf.Dictionary(
+                            {
+                                "/Type": pikepdf.Name("/StructElem"),
+                                "/S": pikepdf.Name(f"/{heading_tag}"),
+                                "/P": page_container,
+                                "/Pg": page.obj,
+                                "/K": pikepdf.Array(),
+                                "/Alt": heading_text,
+                                "/ActualText": heading_text,
+                            }
+                        )
+                    )
+                )
+
+            if len(children) > 0:
                 page_container.K = children
 
             page_structs.append(page_container)
@@ -730,14 +800,28 @@ def convert_pdf(
     page_texts = _collect_page_ocr_texts(page_images, work_dir / "ocr_outputs", ocr_backend=ocr_backend)
     _write_ocr_markdown(page_texts, markdown_path)
 
-    # 4) LLM/heuristic structural tag guesses, then tag the PDF
-    page_tag_guesses = [_guess_page_structure_tags(text) for text in page_texts]
-    _add_minimal_structure_tags(meta_pdf, tagged_pdf, page_tag_guesses=page_tag_guesses)
+    # 4) Build robust inference text per page. If OCR failed on a page, use native PDF text.
+    native_page_texts = _extract_page_texts(meta_pdf)
+    inference_texts = _merge_inference_texts(page_texts, native_page_texts)
 
-    # 4b) LLM/heuristic heading inference and add as PDF bookmarks/TOC
+    # 4b) Infer headings per page (used for both structure tags and bookmarks/TOC).
     inferred_headings: List[Dict[str, object]] = []
-    for page_number, page_text in enumerate(page_texts, start=1):
-        inferred_headings.extend(_infer_page_headings(page_text, page_number))
+    page_headings: List[List[Dict[str, object]]] = []
+    for page_number, page_text in enumerate(inference_texts, start=1):
+        headings_for_page = _infer_page_headings(page_text, page_number)
+        page_headings.append(headings_for_page)
+        inferred_headings.extend(headings_for_page)
+
+    # 4c) LLM/heuristic structural tag guesses, then tag the PDF (with heading tags included).
+    page_tag_guesses = [_guess_page_structure_tags(text) for text in inference_texts]
+    _add_minimal_structure_tags(
+        meta_pdf,
+        tagged_pdf,
+        page_tag_guesses=page_tag_guesses,
+        page_headings=page_headings,
+    )
+
+    # 4d) Add inferred headings as PDF bookmarks/TOC for navigation panes.
     _apply_pdf_headings_as_bookmarks(tagged_pdf, headed_pdf, inferred_headings)
 
     # 5) Alt text generation for extracted images
