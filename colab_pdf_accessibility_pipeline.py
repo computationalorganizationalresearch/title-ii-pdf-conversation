@@ -855,7 +855,7 @@ def _write_report(
 # ---------------------------
 def convert_pdf(
     source_pdf: str,
-    output_pdf: str,
+    output_pdf: Optional[str] = None,
     *,
     title: Optional[str] = None,
     language: str = "en-US",
@@ -867,12 +867,21 @@ def convert_pdf(
     One-line entrypoint for Colab:
         convert_pdf("original.pdf", "convertedaccessibleversion.pdf")
 
+    If output_pdf is omitted, output defaults to source name with
+    "_accessible" inserted before the .pdf extension.
+
     Backends:
     - ocr_backend='local_hf' (default): uses local Hugging Face deepseek-ai/DeepSeek-OCR
     - alt_backend='local_hf' (default), fallback to API if local alt inference fails
     """
     src = Path(source_pdf).expanduser().resolve()
-    dst = Path(output_pdf).expanduser().resolve()
+    if output_pdf:
+        dst = Path(output_pdf).expanduser().resolve()
+    else:
+        if src.suffix.lower() == ".pdf":
+            dst = src.with_name(f"{src.stem}_accessible{src.suffix}").resolve()
+        else:
+            dst = src.with_name(f"{src.name}_accessible.pdf").resolve()
 
     if not src.exists():
         raise FileNotFoundError(f"Source PDF not found: {src}")
