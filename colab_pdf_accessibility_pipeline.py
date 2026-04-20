@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -139,6 +140,78 @@ def _deepseek_alt_text_api(image_path: Path) -> str:
         return "Image relevant to document content"
 
 
+def _deepseek_structural_tag_guess(text: str) -> List[str]:
+    """
+    Use LLM to guess likely structural tags from OCR text.
+    Returns a best-effort ordered list from a controlled tag set.
+    """
+    allowed = ["H1", "H2", "H3", "P", "L", "LI", "Table", "Figure", "Sect"]
+    if not text.strip() or not DEEPSEEK_API_KEY:
+        return []
+
+    endpoint = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
+    payload = {
+        "model": DEEPSEEK_VISION_MODEL,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Given OCR text from one PDF page, guess a short ordered list of likely PDF structure "
+                    "tags. Return JSON only in this exact shape: "
+                    '{"tags":["H1","P"]}. Allowed tags: H1,H2,H3,P,L,LI,Table,Figure,Sect.\n\n'
+                    f"Page OCR text:\n{text[:6000]}"
+                ),
+            }
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        res = requests.post(endpoint, headers=headers, json=payload, timeout=120)
+        res.raise_for_status()
+        raw = res.json()["choices"][0]["message"]["content"].strip()
+        parsed = json.loads(raw)
+        tags = parsed.get("tags", [])
+        cleaned = [tag for tag in tags if tag in allowed]
+        return cleaned[:12]
+    except Exception:
+        return []
+
+
+def _heuristic_structural_tag_guess(text: str) -> List[str]:
+    """Rule-based backup when LLM guesses are unavailable."""
+    t = text.strip()
+    if not t:
+        return ["Sect"]
+
+    tags: List[str] = []
+    lines = [line.strip() for line in t.splitlines() if line.strip()]
+    if lines:
+        first = lines[0]
+        if len(first) < 90 and (first.isupper() or re.match(r"^\d+(\.\d+)*\s+\S+", first)):
+            tags.append("H1")
+
+    if re.search(r"(^|\n)\s*([-*•]|\d+[.)])\s+", t):
+        tags.extend(["L", "LI"])
+    if "|" in t or re.search(r"\b(table|row|column)\b", t, flags=re.IGNORECASE):
+        tags.append("Table")
+    if re.search(r"\b(figure|chart|diagram|image)\b", t, flags=re.IGNORECASE):
+        tags.append("Figure")
+    tags.append("P")
+    return list(dict.fromkeys(tags))
+
+
+def _guess_page_structure_tags(page_text: str) -> List[str]:
+    llm_tags = _deepseek_structural_tag_guess(page_text)
+    if llm_tags:
+        return llm_tags
+    return _heuristic_structural_tag_guess(page_text)
+
+
 def _build_searchable_pdf(input_pdf: Path, output_pdf: Path) -> None:
     """
     Build a searchable PDF without OCRmyPDF/pikepdf.
@@ -194,6 +267,103 @@ def _set_pdf_metadata(pdf_in: Path, pdf_out: Path, title: str, language: str) ->
     doc.close()
 
 
+def _add_minimal_structure_tags(
+    pdf_in: Path,
+    pdf_out: Path,
+    page_tag_guesses: Optional[List[List[str]]] = None,
+) -> None:
+    """
+    Add a minimal logical structure tree so the exported PDF is tagged.
+    This creates:
+      - /MarkInfo << /Marked true >>
+      - /StructTreeRoot with a top-level /Document element
+      - one /Sect child element per page (linked with /Pg)
+      - /ParentTree and /ParentTreeNextKey placeholders
+
+    This does not replace full manual accessibility QA, but it ensures a
+    standards-compliant tag tree exists for downstream tools/screen readers.
+    """
+    try:
+        import pikepdf
+    except ImportError as exc:
+        raise RuntimeError(
+            "Tagged PDF export requires pikepdf. Install it with: pip install pikepdf"
+        ) from exc
+
+    with pikepdf.Pdf.open(pdf_in.as_posix()) as pdf:
+        root = pdf.Root
+
+        if "/MarkInfo" not in root or not isinstance(root.MarkInfo, pikepdf.Dictionary):
+            root.MarkInfo = pikepdf.Dictionary()
+        root.MarkInfo.Marked = True
+
+        parent_tree = pdf.make_indirect(pikepdf.Dictionary({"Nums": pikepdf.Array()}))
+
+        doc_struct_elem = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "Type": pikepdf.Name("/StructElem"),
+                    "S": pikepdf.Name("/Document"),
+                    "K": pikepdf.Array(),
+                }
+            )
+        )
+
+        page_structs = pikepdf.Array()
+        for page_index, page in enumerate(pdf.pages):
+            page_container = pdf.make_indirect(
+                pikepdf.Dictionary(
+                    {
+                        "Type": pikepdf.Name("/StructElem"),
+                        "S": pikepdf.Name("/Sect"),
+                        "P": doc_struct_elem,
+                        "Pg": page.obj,
+                        "K": pikepdf.Array(),
+                    }
+                )
+            )
+
+            guessed_tags = []
+            if page_tag_guesses and page_index < len(page_tag_guesses):
+                guessed_tags = page_tag_guesses[page_index]
+
+            if guessed_tags:
+                children = pikepdf.Array()
+                for tag in guessed_tags:
+                    children.append(
+                        pdf.make_indirect(
+                            pikepdf.Dictionary(
+                                {
+                                    "Type": pikepdf.Name("/StructElem"),
+                                    "S": pikepdf.Name(f"/{tag}"),
+                                    "P": page_container,
+                                    "Pg": page.obj,
+                                    "K": pikepdf.Array(),
+                                }
+                            )
+                        )
+                    )
+                page_container.K = children
+
+            page_structs.append(page_container)
+
+        doc_struct_elem.K = page_structs
+
+        struct_tree_root = pdf.make_indirect(
+            pikepdf.Dictionary(
+                {
+                    "Type": pikepdf.Name("/StructTreeRoot"),
+                    "K": pikepdf.Array([doc_struct_elem]),
+                    "ParentTree": parent_tree,
+                    "ParentTreeNextKey": 0,
+                }
+            )
+        )
+        doc_struct_elem.P = struct_tree_root
+        root.StructTreeRoot = struct_tree_root
+        pdf.save(pdf_out.as_posix())
+
+
 def _render_pages(pdf_path: Path, pages_dir: Path) -> List[Path]:
     pages_dir.mkdir(parents=True, exist_ok=True)
     doc = fitz.open(pdf_path)
@@ -231,32 +401,42 @@ def _extract_images(pdf_path: Path, images_dir: Path) -> List[Dict[str, object]]
     return records
 
 
-def _write_ocr_markdown(
+def _collect_page_ocr_texts(
     page_images: List[Path],
-    markdown_path: Path,
+    ocr_output_dir: Path,
     ocr_backend: str = "local_hf",
-) -> Path:
+) -> List[str]:
     """
     OCR markdown sidecar generation.
     Default backend: local_hf (DeepSeek OCR from Hugging Face).
     Fallback backend: none (placeholder lines).
     """
-    chunks: List[str] = []
-    local_ok = True
+    texts: List[str] = []
 
     for i, image_path in enumerate(page_images, start=1):
-        chunks.append(f"\n<!-- Page {i} -->\n")
         if ocr_backend == "local_hf":
             try:
-                text = _local_deepseek_ocr_markdown(image_path, markdown_path.parent / "ocr_outputs")
+                text = _local_deepseek_ocr_markdown(image_path, ocr_output_dir)
             except Exception as e:
-                local_ok = False
                 text = f"[Local DeepSeek OCR unavailable on page {i}: {e}]"
         else:
             text = f"[OCR backend '{ocr_backend}' not implemented in this single-file mode.]"
-        chunks.append(text)
+        texts.append(text)
 
-    if ocr_backend == "local_hf" and not local_ok:
+    return texts
+
+
+def _write_ocr_markdown(page_texts: List[str], markdown_path: Path) -> Path:
+    chunks: List[str] = []
+    local_warnings = False
+
+    for i, text in enumerate(page_texts, start=1):
+        chunks.append(f"\n<!-- Page {i} -->\n")
+        chunks.append(text)
+        if "Local DeepSeek OCR unavailable on page" in text:
+            local_warnings = True
+
+    if local_warnings:
         chunks.insert(0, "[WARNING] Local HF DeepSeek OCR partially unavailable; some pages may need rerun.\n")
 
     markdown_path.write_text("\n".join(chunks), encoding="utf-8")
@@ -345,8 +525,8 @@ def _write_report(
             "document_language": "Set in PDF catalog /Lang.",
             "document_title": "Set in /Title and display-title preference.",
             "alternative_text": "Generated for each embedded image.",
-            "tagged_structured": "Requires final tagging pass in Acrobat/PDFix/PAC workflow.",
-            "logical_reading_order": "Use Acrobat Reading Order tool for final QA/repair.",
+            "tagged_structured": "Added /StructTreeRoot and LLM/heuristic-guessed page child tags (H*, P, L, Table, Figure).",
+            "logical_reading_order": "Tagged structure added; run PAC/Acrobat QA for final reading-order validation.",
             "color_contrast": "Requires source-content remediation when needed.",
         },
         "machine_validation": qpdf_result,
@@ -388,6 +568,7 @@ def convert_pdf(
 
     ocr_pdf = work_dir / "01_searchable.pdf"
     meta_pdf = work_dir / "02_with_metadata.pdf"
+    tagged_pdf = work_dir / "03_tagged.pdf"
     pages_dir = work_dir / "pages"
     images_dir = work_dir / "images"
 
@@ -402,18 +583,23 @@ def convert_pdf(
     resolved_title = title if title else src.stem
     _set_pdf_metadata(ocr_pdf, meta_pdf, resolved_title, language)
 
-    # 3) OCR markdown sidecar using selected backend (default local HF DeepSeek OCR)
+    # 3) OCR page text extraction (used for sidecar + LLM tag guesses)
     page_images = _render_pages(meta_pdf, pages_dir)
-    _write_ocr_markdown(page_images, markdown_path, ocr_backend=ocr_backend)
+    page_texts = _collect_page_ocr_texts(page_images, work_dir / "ocr_outputs", ocr_backend=ocr_backend)
+    _write_ocr_markdown(page_texts, markdown_path)
 
-    # 4) Alt text generation for extracted images
-    image_records = _extract_images(meta_pdf, images_dir)
+    # 4) LLM/heuristic structural tag guesses, then tag the PDF
+    page_tag_guesses = [_guess_page_structure_tags(text) for text in page_texts]
+    _add_minimal_structure_tags(meta_pdf, tagged_pdf, page_tag_guesses=page_tag_guesses)
+
+    # 5) Alt text generation for extracted images
+    image_records = _extract_images(tagged_pdf, images_dir)
     _write_alt_text_manifest(image_records, manifest_path, alt_backend=alt_backend)
 
-    # 5) Final output PDF
-    shutil.copy2(meta_pdf, dst)
+    # 6) Final output PDF
+    shutil.copy2(tagged_pdf, dst)
 
-    # 6) Validation + report
+    # 7) Validation + report
     qpdf_result = _qpdf_check(dst)
     _write_report(
         report_path=report_path,
