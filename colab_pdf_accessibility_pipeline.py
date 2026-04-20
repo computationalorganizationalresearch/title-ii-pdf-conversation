@@ -2,7 +2,7 @@
 Single-file, Colab-pasteable PDF accessibility pipeline.
 
 One-line usage:
-    convert_pdf("original.pdf", "convertedaccessibleversion.pdf")
+    convert_pdf("original.pdf", "converted/convertedaccessibleversion.pdf")
 
 Default OCR backend is LOCAL Hugging Face DeepSeek OCR.
 If unavailable, pipeline falls back gracefully.
@@ -91,7 +91,10 @@ def _load_local_deepseek_ocr_model(model_name: str = DEEPSEEK_OCR_MODEL_NAME):
     )
 
     if torch.cuda.is_available():
-        model = model.eval().cuda().to(torch.bfloat16)
+        # Prefer GPU execution when available, while choosing a safe dtype.
+        major, _minor = torch.cuda.get_device_capability(0)
+        gpu_dtype = torch.bfloat16 if major >= 8 else torch.float16
+        model = model.eval().to("cuda").to(gpu_dtype)
     else:
         model = model.eval()
 
@@ -867,7 +870,8 @@ def convert_pdf(
     One-line entrypoint for Colab:
         convert_pdf("original.pdf", "convertedaccessibleversion.pdf")
 
-    If output_pdf is omitted, output defaults to source name with
+    Output is always saved inside a sibling "converted" folder.
+    If output_pdf is omitted, filename defaults to source name with
     "_accessible" inserted before the .pdf extension.
 
     Backends:
@@ -875,16 +879,22 @@ def convert_pdf(
     - alt_backend='local_hf' (default), fallback to API if local alt inference fails
     """
     src = Path(source_pdf).expanduser().resolve()
-    if output_pdf:
-        dst = Path(output_pdf).expanduser().resolve()
-    else:
-        if src.suffix.lower() == ".pdf":
-            dst = src.with_name(f"{src.stem}_accessible{src.suffix}").resolve()
-        else:
-            dst = src.with_name(f"{src.name}_accessible.pdf").resolve()
-
     if not src.exists():
         raise FileNotFoundError(f"Source PDF not found: {src}")
+
+    converted_dir = src.parent / "converted"
+    converted_dir.mkdir(parents=True, exist_ok=True)
+
+    if output_pdf:
+        requested_name = Path(output_pdf).name
+        if not requested_name.lower().endswith(".pdf"):
+            requested_name = f"{requested_name}.pdf"
+        dst = (converted_dir / requested_name).resolve()
+    else:
+        if src.suffix.lower() == ".pdf":
+            dst = (converted_dir / f"{src.stem}_accessible{src.suffix}").resolve()
+        else:
+            dst = (converted_dir / f"{src.name}_accessible.pdf").resolve()
 
     _ensure_parent(dst)
 
@@ -896,11 +906,6 @@ def convert_pdf(
     tagged_pdf = work_dir / "03_tagged.pdf"
     headed_pdf = work_dir / "04_with_headings.pdf"
     pages_dir = work_dir / "pages"
-    images_dir = work_dir / "images"
-
-    markdown_path = dst.with_suffix(dst.suffix + ".ocr.md")
-    manifest_path = dst.with_suffix(dst.suffix + ".alt_text_manifest.json")
-    report_path = dst.with_suffix(dst.suffix + ".accessibility_report.json")
 
     # 1) Searchable PDF (best visual fidelity for scanned and text-like docs)
     _build_searchable_pdf(src, ocr_pdf)
@@ -912,8 +917,6 @@ def convert_pdf(
     # 3) OCR page text extraction (used for sidecar + LLM tag guesses)
     page_images = _render_pages(meta_pdf, pages_dir)
     page_texts = _collect_page_ocr_texts(page_images, work_dir / "ocr_outputs", ocr_backend=ocr_backend)
-    _write_ocr_markdown(page_texts, markdown_path)
-
     # 4) Build robust inference text per page. If OCR failed on a page, use native PDF text.
     native_page_texts = _extract_page_texts(meta_pdf)
     inference_texts = _merge_inference_texts(page_texts, native_page_texts)
@@ -946,26 +949,11 @@ def convert_pdf(
     # 4d) Add inferred headings as PDF bookmarks/TOC for navigation panes.
     _apply_pdf_headings_as_bookmarks(tagged_pdf, headed_pdf, inferred_headings)
 
-    # 5) Alt text generation for extracted images
-    image_records = _extract_images(headed_pdf, images_dir)
-    _write_alt_text_manifest(image_records, manifest_path, alt_backend=alt_backend)
-
-    # 6) Final output PDF
+    # 5) Final output PDF
     shutil.copy2(headed_pdf, dst)
 
-    # 7) Validation + report
-    qpdf_result = _qpdf_check(dst)
-    _write_report(
-        report_path=report_path,
-        source_pdf=src,
-        output_pdf=dst,
-        manifest_path=manifest_path,
-        markdown_path=markdown_path,
-        qpdf_result=qpdf_result,
-        ocr_backend=ocr_backend,
-        alt_backend=alt_backend,
-        inferred_heading_count=len(inferred_headings),
-    )
+    # 6) Validation only (no sidecar exports).
+    _qpdf_check(dst)
 
     if not keep_workdir:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -973,9 +961,6 @@ def convert_pdf(
     return {
         "source_pdf": src.as_posix(),
         "output_pdf": dst.as_posix(),
-        "ocr_markdown": markdown_path.as_posix(),
-        "alt_text_manifest": manifest_path.as_posix(),
-        "report": report_path.as_posix(),
     }
 
 
