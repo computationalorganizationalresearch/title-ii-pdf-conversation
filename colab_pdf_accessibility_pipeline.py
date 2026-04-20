@@ -17,9 +17,8 @@ import re
 import shutil
 import subprocess
 import tempfile
-from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import fitz  # PyMuPDF
 import requests
@@ -56,19 +55,47 @@ def _data_url(image_path: Path) -> str:
     return f"data:{mime};base64,{b64}"
 
 
-@lru_cache(maxsize=1)
+_LOCAL_DEEPSEEK_OCR_SINGLETON: Dict[str, Any] = {
+    "model_name": None,
+    "tokenizer": None,
+    "model": None,
+    "device": None,
+    "dtype": None,
+    "error": None,
+}
+
+
 def _load_local_deepseek_ocr_model(model_name: str = DEEPSEEK_OCR_MODEL_NAME):
     """
     Lazy-load local HF DeepSeek OCR model.
     Matches user's sample approach and keeps it optional.
     """
+    state = _LOCAL_DEEPSEEK_OCR_SINGLETON
+    if (
+        state["model_name"] == model_name
+        and state["tokenizer"] is not None
+        and state["model"] is not None
+    ):
+        return state["tokenizer"], state["model"]
+    if state["model_name"] == model_name and state["error"] is not None:
+        raise RuntimeError(str(state["error"]))
+
     try:
         import addict  # type: ignore # noqa: F401
     except Exception as exc:
-        raise RuntimeError(
+        err = RuntimeError(
             "Local DeepSeek OCR requires the 'addict' package. "
             "Install it with: pip install addict"
-        ) from exc
+        )
+        state.update(
+            {
+                "model_name": model_name,
+                "error": f"{err} (original error: {exc})",
+                "tokenizer": None,
+                "model": None,
+            }
+        )
+        raise RuntimeError(str(state["error"])) from exc
 
     from transformers import AutoModel, AutoTokenizer
     import torch
@@ -77,28 +104,72 @@ def _load_local_deepseek_ocr_model(model_name: str = DEEPSEEK_OCR_MODEL_NAME):
     if DEEPSEEK_OCR_REVISION:
         model_load_kwargs["revision"] = DEEPSEEK_OCR_REVISION
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name,
-        trust_remote_code=True,
-        **model_load_kwargs,
-    )
-    model = AutoModel.from_pretrained(
-        model_name,
-        _attn_implementation="flash_attention_2",
-        trust_remote_code=True,
-        use_safetensors=True,
-        **model_load_kwargs,
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            **model_load_kwargs,
+        )
 
-    if torch.cuda.is_available():
-        # Prefer GPU execution when available, while choosing a safe dtype.
-        major, _minor = torch.cuda.get_device_capability(0)
-        gpu_dtype = torch.bfloat16 if major >= 8 else torch.float16
-        model = model.eval().to("cuda").to(gpu_dtype)
-    else:
-        model = model.eval()
+        use_cuda = torch.cuda.is_available()
+        model_load_options = dict(model_load_kwargs)
+        if use_cuda:
+            # Prefer GPU execution when available, while choosing a safe dtype.
+            major, _minor = torch.cuda.get_device_capability(0)
+            gpu_dtype = torch.bfloat16 if major >= 8 else torch.float16
+            model_load_options["torch_dtype"] = gpu_dtype
+            model_load_options["low_cpu_mem_usage"] = True
 
-    return tokenizer, model
+        model = AutoModel.from_pretrained(
+            model_name,
+            _attn_implementation="flash_attention_2",
+            trust_remote_code=True,
+            use_safetensors=True,
+            **model_load_options,
+        ).eval()
+
+        if use_cuda:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            model = model.to("cuda")
+            state.update({"device": "cuda", "dtype": str(model.dtype)})
+        else:
+            state.update({"device": "cpu", "dtype": str(model.dtype)})
+
+        state.update(
+            {
+                "model_name": model_name,
+                "tokenizer": tokenizer,
+                "model": model,
+                "error": None,
+            }
+        )
+        return tokenizer, model
+    except Exception as exc:
+        state.update(
+            {
+                "model_name": model_name,
+                "tokenizer": None,
+                "model": None,
+                "device": None,
+                "dtype": None,
+                "error": f"Failed loading local DeepSeek OCR model '{model_name}': {exc}",
+            }
+        )
+        raise RuntimeError(str(state["error"])) from exc
+
+
+def _warmup_local_deepseek_ocr_model(model_name: str = DEEPSEEK_OCR_MODEL_NAME) -> None:
+    """
+    Initialize local OCR model exactly once per process and print backend info.
+    This avoids repeated lazy-load attempts inside per-page loops.
+    """
+    _load_local_deepseek_ocr_model(model_name=model_name)
+    state = _LOCAL_DEEPSEEK_OCR_SINGLETON
+    print(
+        f"[DeepSeek OCR] loaded model='{model_name}' "
+        f"device={state.get('device')} dtype={state.get('dtype')}"
+    )
 
 
 def _local_deepseek_ocr_markdown(image_path: Path, output_dir: Path) -> str:
@@ -906,6 +977,13 @@ def convert_pdf(
     tagged_pdf = work_dir / "03_tagged.pdf"
     headed_pdf = work_dir / "04_with_headings.pdf"
     pages_dir = work_dir / "pages"
+
+    # Warm model once so per-page OCR/alt-text calls reuse the singleton.
+    if ocr_backend == "local_hf" or alt_backend == "local_hf":
+        try:
+            _warmup_local_deepseek_ocr_model()
+        except Exception as exc:
+            print(f"[DeepSeek OCR] warmup failed: {exc}")
 
     # 1) Searchable PDF (best visual fidelity for scanned and text-like docs)
     _build_searchable_pdf(src, ocr_pdf)
