@@ -200,6 +200,118 @@ def _deepseek_structural_tag_guess(text: str) -> List[str]:
         return []
 
 
+def _deepseek_heading_guess(page_text: str, page_number: int) -> List[Dict[str, object]]:
+    """
+    Use LLM to infer likely headings from page OCR text.
+    Returns [{level:int(1-3), text:str, page:int}, ...].
+    """
+    if not page_text.strip() or not DEEPSEEK_API_KEY:
+        return []
+
+    endpoint = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
+    payload = {
+        "model": DEEPSEEK_VISION_MODEL,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "You receive OCR text from one PDF page. Infer likely section headings only. "
+                    "Return JSON only using this exact shape: "
+                    '{"headings":[{"level":1,"text":"Introduction"}]}. '
+                    "Rules: level must be 1,2,or 3; keep heading text concise; no body text.\n\n"
+                    f"Page number: {page_number}\n"
+                    f"OCR text:\n{page_text[:7000]}"
+                ),
+            }
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        res = requests.post(endpoint, headers=headers, json=payload, timeout=120)
+        res.raise_for_status()
+        raw = res.json()["choices"][0]["message"]["content"].strip()
+        parsed = json.loads(raw)
+        out: List[Dict[str, object]] = []
+        for h in parsed.get("headings", []):
+            text = str(h.get("text", "")).strip()
+            try:
+                level = int(h.get("level", 1))
+            except Exception:
+                level = 1
+            if not text:
+                continue
+            level = min(3, max(1, level))
+            out.append({"level": level, "text": text, "page": page_number})
+        return out[:8]
+    except Exception:
+        return []
+
+
+def _heuristic_heading_guess(page_text: str, page_number: int) -> List[Dict[str, object]]:
+    """Rule-based heading fallback from OCR text."""
+    lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+    headings: List[Dict[str, object]] = []
+
+    for line in lines[:18]:
+        clean = re.sub(r"\s+", " ", line).strip(" -:\t")
+        if not clean:
+            continue
+        if len(clean) > 95:
+            continue
+        if re.match(r"^\d+(\.\d+){0,3}\s+\S+", clean):
+            level = min(3, clean.count(".") + 1)
+            headings.append({"level": level, "text": clean, "page": page_number})
+            continue
+        if clean.isupper() and len(clean.split()) <= 10:
+            headings.append({"level": 1, "text": clean.title(), "page": page_number})
+            continue
+        if clean.endswith(":") and len(clean.split()) <= 12:
+            headings.append({"level": 2, "text": clean.rstrip(":"), "page": page_number})
+
+    # Keep unique while preserving order.
+    seen = set()
+    unique: List[Dict[str, object]] = []
+    for h in headings:
+        key = (h["level"], h["text"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(h)
+    return unique[:4]
+
+
+def _infer_page_headings(page_text: str, page_number: int) -> List[Dict[str, object]]:
+    llm = _deepseek_heading_guess(page_text, page_number)
+    if llm:
+        return llm
+    return _heuristic_heading_guess(page_text, page_number)
+
+
+def _apply_pdf_headings_as_bookmarks(pdf_in: Path, pdf_out: Path, headings: List[Dict[str, object]]) -> None:
+    """
+    Add inferred headings as PDF bookmarks (table-of-contents/navigation).
+    """
+    doc = fitz.open(pdf_in.as_posix())
+    toc: List[List[object]] = []
+    for h in headings:
+        heading_text = str(h.get("text", "")).strip()
+        if not heading_text:
+            continue
+        level = int(h.get("level", 1))
+        page = int(h.get("page", 1))
+        toc.append([min(3, max(1, level)), heading_text, max(1, page)])
+
+    if toc:
+        doc.set_toc(toc)
+    doc.save(pdf_out.as_posix(), garbage=3, deflate=True)
+    doc.close()
+
+
 def _heuristic_structural_tag_guess(text: str) -> List[str]:
     """Rule-based backup when LLM guesses are unavailable."""
     t = text.strip()
@@ -533,6 +645,7 @@ def _write_report(
     qpdf_result: Dict[str, object],
     ocr_backend: str,
     alt_backend: str,
+    inferred_heading_count: int,
 ) -> None:
     report = {
         "source_pdf": source_pdf.as_posix(),
@@ -546,6 +659,14 @@ def _write_report(
             "document_title": "Set in /Title and display-title preference.",
             "alternative_text": "Generated for each embedded image.",
             "tagged_structured": "Added /StructTreeRoot and LLM/heuristic-guessed page child tags (H*, P, L, Table, Figure).",
+            "headings_navigation": (
+                f"Inferred headings added as PDF bookmarks/table-of-contents entries: {inferred_heading_count}."
+            ),
+            "why_headings": [
+                "Facilitates reading by adding structure and clarity.",
+                "Essential for screen-reader users and students with visual impairments.",
+                "Enables easier navigation and automatic table-of-contents generation.",
+            ],
             "logical_reading_order": "Tagged structure added; run PAC/Acrobat QA for final reading-order validation.",
             "color_contrast": "Requires source-content remediation when needed.",
         },
@@ -589,6 +710,7 @@ def convert_pdf(
     ocr_pdf = work_dir / "01_searchable.pdf"
     meta_pdf = work_dir / "02_with_metadata.pdf"
     tagged_pdf = work_dir / "03_tagged.pdf"
+    headed_pdf = work_dir / "04_with_headings.pdf"
     pages_dir = work_dir / "pages"
     images_dir = work_dir / "images"
 
@@ -612,12 +734,18 @@ def convert_pdf(
     page_tag_guesses = [_guess_page_structure_tags(text) for text in page_texts]
     _add_minimal_structure_tags(meta_pdf, tagged_pdf, page_tag_guesses=page_tag_guesses)
 
+    # 4b) LLM/heuristic heading inference and add as PDF bookmarks/TOC
+    inferred_headings: List[Dict[str, object]] = []
+    for page_number, page_text in enumerate(page_texts, start=1):
+        inferred_headings.extend(_infer_page_headings(page_text, page_number))
+    _apply_pdf_headings_as_bookmarks(tagged_pdf, headed_pdf, inferred_headings)
+
     # 5) Alt text generation for extracted images
-    image_records = _extract_images(tagged_pdf, images_dir)
+    image_records = _extract_images(headed_pdf, images_dir)
     _write_alt_text_manifest(image_records, manifest_path, alt_backend=alt_backend)
 
     # 6) Final output PDF
-    shutil.copy2(tagged_pdf, dst)
+    shutil.copy2(headed_pdf, dst)
 
     # 7) Validation + report
     qpdf_result = _qpdf_check(dst)
@@ -630,6 +758,7 @@ def convert_pdf(
         qpdf_result=qpdf_result,
         ocr_backend=ocr_backend,
         alt_backend=alt_backend,
+        inferred_heading_count=len(inferred_headings),
     )
 
     if not keep_workdir:
