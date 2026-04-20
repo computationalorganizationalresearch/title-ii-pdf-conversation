@@ -31,6 +31,7 @@ DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_VISION_MODEL = os.getenv("DEEPSEEK_VISION_MODEL", "deepseek-vl2")
 DEEPSEEK_OCR_MODEL_NAME = os.getenv("DEEPSEEK_OCR_MODEL_NAME", "deepseek-ai/DeepSeek-OCR")
+DEEPSEEK_OCR_REVISION = os.getenv("DEEPSEEK_OCR_REVISION")
 
 
 # ---------------------------
@@ -72,12 +73,21 @@ def _load_local_deepseek_ocr_model(model_name: str = DEEPSEEK_OCR_MODEL_NAME):
     from transformers import AutoModel, AutoTokenizer
     import torch
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    model_load_kwargs = {}
+    if DEEPSEEK_OCR_REVISION:
+        model_load_kwargs["revision"] = DEEPSEEK_OCR_REVISION
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        **model_load_kwargs,
+    )
     model = AutoModel.from_pretrained(
         model_name,
         _attn_implementation="flash_attention_2",
         trust_remote_code=True,
         use_safetensors=True,
+        **model_load_kwargs,
     )
 
     if torch.cuda.is_available():
@@ -303,9 +313,11 @@ def _add_minimal_structure_tags(
 
         if "/MarkInfo" not in root or not isinstance(root.MarkInfo, pikepdf.Dictionary):
             root.MarkInfo = pikepdf.Dictionary()
-        root.MarkInfo.Marked = True
+        root.MarkInfo["/Marked"] = True
 
-        parent_tree = pdf.make_indirect(pikepdf.Dictionary({"/Nums": pikepdf.Array()}))
+        parent_tree_dict = pikepdf.Dictionary()
+        parent_tree_dict["/Nums"] = pikepdf.Array()
+        parent_tree = pdf.make_indirect(parent_tree_dict)
 
         doc_struct_elem = pdf.make_indirect(
             pikepdf.Dictionary(
