@@ -680,6 +680,9 @@ def _add_minimal_structure_tags(
             guessed_tags = []
             if page_tag_guesses and page_index < len(page_tag_guesses):
                 guessed_tags = page_tag_guesses[page_index]
+            # Heading tags are injected from inferred heading items below so we can
+            # keep strict H1/H2/H3 reading order and avoid duplicate heading nodes.
+            guessed_tags = [tag for tag in guessed_tags if tag not in {"H1", "H2", "H3"}]
 
             children = pikepdf.Array()
             if guessed_tags:
@@ -974,8 +977,8 @@ def convert_pdf(
 
     ocr_pdf = work_dir / "01_searchable.pdf"
     meta_pdf = work_dir / "02_with_metadata.pdf"
-    tagged_pdf = work_dir / "03_tagged.pdf"
-    headed_pdf = work_dir / "04_with_headings.pdf"
+    headed_pdf = work_dir / "03_with_headings.pdf"
+    tagged_pdf = work_dir / "04_tagged.pdf"
     pages_dir = work_dir / "pages"
 
     # Warm model once so per-page OCR/alt-text calls reuse the singleton.
@@ -1015,20 +1018,21 @@ def convert_pdf(
         headings_by_page.setdefault(page_no, []).append(heading)
     page_headings = [headings_by_page.get(i + 1, []) for i in range(len(inference_texts))]
 
-    # 4c) LLM/heuristic structural tag guesses, then tag the PDF (with heading tags included).
+    # 4c) Add inferred headings as PDF bookmarks/TOC for navigation panes.
+    # Do this BEFORE writing the tag tree so later edits do not risk dropping it.
+    _apply_pdf_headings_as_bookmarks(meta_pdf, headed_pdf, inferred_headings)
+
+    # 4d) LLM/heuristic structural tag guesses, then tag the PDF (with heading tags included).
     page_tag_guesses = [_guess_page_structure_tags(text) for text in inference_texts]
     _add_minimal_structure_tags(
-        meta_pdf,
+        headed_pdf,
         tagged_pdf,
         page_tag_guesses=page_tag_guesses,
         page_headings=page_headings,
     )
 
-    # 4d) Add inferred headings as PDF bookmarks/TOC for navigation panes.
-    _apply_pdf_headings_as_bookmarks(tagged_pdf, headed_pdf, inferred_headings)
-
     # 5) Final output PDF
-    shutil.copy2(headed_pdf, dst)
+    shutil.copy2(tagged_pdf, dst)
 
     # 6) Validation only (no sidecar exports).
     _qpdf_check(dst)
