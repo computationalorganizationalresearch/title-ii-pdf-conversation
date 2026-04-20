@@ -252,6 +252,84 @@ def _deepseek_heading_guess(page_text: str, page_number: int) -> List[Dict[str, 
         return []
 
 
+def _deepseek_relevel_headings(headings: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """
+    Re-level inferred headings so the document hierarchy starts at H1 and
+    preserves relative nesting across pages.
+    """
+    if not headings:
+        return []
+    if not DEEPSEEK_API_KEY:
+        return _heuristic_relevel_headings(headings)
+
+    endpoint = f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions"
+    compact = [
+        {
+            "index": i,
+            "page": int(h.get("page", 1)),
+            "level": int(h.get("level", 1)),
+            "text": str(h.get("text", "")).strip(),
+        }
+        for i, h in enumerate(headings)
+        if str(h.get("text", "")).strip()
+    ]
+    if not compact:
+        return []
+
+    payload = {
+        "model": DEEPSEEK_VISION_MODEL,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "You receive extracted PDF headings in reading order. "
+                    "Reassign only their heading levels so hierarchy starts at H1 and preserves "
+                    "relative nesting. Keep each heading text unchanged. "
+                    "Return JSON only with this exact shape: "
+                    '{"headings":[{"index":0,"level":1}]}. '
+                    "Rules: level must be 1,2,or 3; at least one heading must be level 1; "
+                    "do not remove or add indexes.\n\n"
+                    f"Headings:\n{json.dumps(compact, ensure_ascii=False)[:12000]}"
+                ),
+            }
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        res = requests.post(endpoint, headers=headers, json=payload, timeout=120)
+        res.raise_for_status()
+        raw = res.json()["choices"][0]["message"]["content"].strip()
+        parsed = json.loads(raw)
+        by_index = {}
+        for item in parsed.get("headings", []):
+            try:
+                idx = int(item.get("index", -1))
+                lvl = int(item.get("level", 1))
+            except Exception:
+                continue
+            if idx < 0:
+                continue
+            by_index[idx] = min(3, max(1, lvl))
+
+        if not by_index:
+            return _heuristic_relevel_headings(headings)
+
+        updated: List[Dict[str, object]] = []
+        for i, h in enumerate(headings):
+            new_h = dict(h)
+            if i in by_index:
+                new_h["level"] = by_index[i]
+            updated.append(new_h)
+        return _heuristic_relevel_headings(updated)
+    except Exception:
+        return _heuristic_relevel_headings(headings)
+
+
 def _heuristic_heading_guess(page_text: str, page_number: int) -> List[Dict[str, object]]:
     """Rule-based heading fallback from OCR text."""
     lines = [line.strip() for line in page_text.splitlines() if line.strip()]
@@ -283,6 +361,37 @@ def _heuristic_heading_guess(page_text: str, page_number: int) -> List[Dict[str,
         seen.add(key)
         unique.append(h)
     return unique[:4]
+
+
+def _heuristic_relevel_headings(headings: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    """Normalize heading levels to start at H1 while keeping relative differences."""
+    cleaned: List[Dict[str, object]] = []
+    levels: List[int] = []
+    for h in headings:
+        text = str(h.get("text", "")).strip()
+        if not text:
+            continue
+        try:
+            level = int(h.get("level", 1))
+        except Exception:
+            level = 1
+        level = min(3, max(1, level))
+        new_h = dict(h)
+        new_h["text"] = text
+        new_h["level"] = level
+        cleaned.append(new_h)
+        levels.append(level)
+
+    if not cleaned:
+        return []
+
+    shift = min(levels) - 1
+    if shift <= 0:
+        return cleaned
+
+    for h in cleaned:
+        h["level"] = min(3, max(1, int(h["level"]) - shift))
+    return cleaned
 
 
 def _infer_page_headings(page_text: str, page_number: int) -> List[Dict[str, object]]:
@@ -326,12 +435,8 @@ def _merge_inference_texts(ocr_texts: List[str], native_texts: List[str]) -> Lis
 
 
 def _normalize_heading_level_to_hn(level: int) -> str:
-    """
-    Normalize inferred headings to H2 to mirror Acrobat's manual
-    "set tag type to <H2>" workflow for section headings.
-    """
-    _ = level
-    return "H2"
+    """Map inferred heading levels directly to H1/H2/H3 tags."""
+    return f"H{min(3, max(1, int(level)))}"
 
 
 def _apply_pdf_headings_as_bookmarks(pdf_in: Path, pdf_out: Path, headings: List[Dict[str, object]]) -> None:
@@ -811,6 +916,14 @@ def convert_pdf(
         headings_for_page = _infer_page_headings(page_text, page_number)
         page_headings.append(headings_for_page)
         inferred_headings.extend(headings_for_page)
+
+    # Normalize hierarchy so headings start at H1 and preserve relative depth.
+    inferred_headings = _deepseek_relevel_headings(inferred_headings)
+    headings_by_page: Dict[int, List[Dict[str, object]]] = {}
+    for heading in inferred_headings:
+        page_no = int(heading.get("page", 1))
+        headings_by_page.setdefault(page_no, []).append(heading)
+    page_headings = [headings_by_page.get(i + 1, []) for i in range(len(inference_texts))]
 
     # 4c) LLM/heuristic structural tag guesses, then tag the PDF (with heading tags included).
     page_tag_guesses = [_guess_page_structure_tags(text) for text in inference_texts]
