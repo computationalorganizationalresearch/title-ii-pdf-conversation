@@ -15,12 +15,12 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import fitz  # PyMuPDF
-import pikepdf
 import requests
 
 # ---------------------------
@@ -141,39 +141,57 @@ def _deepseek_alt_text_api(image_path: Path) -> str:
 
 def _build_searchable_pdf(input_pdf: Path, output_pdf: Path) -> None:
     """
-    Works for scanned image PDFs, mixed PDFs, and text-like PDFs.
-    --skip-text preserves text-native pages and OCRs only non-searchable pages.
+    Build a searchable PDF without OCRmyPDF/pikepdf.
+    Strategy:
+    - If page already has text, preserve original page.
+    - If page has no text, rasterize and OCR with Tesseract PDF output.
     """
-    _run(
-        [
-            "ocrmypdf",
-            "--skip-text",
-            "--deskew",
-            "--clean-final",
-            "--optimize",
-            "1",
-            input_pdf.as_posix(),
-            output_pdf.as_posix(),
-        ]
-    )
+    src = fitz.open(input_pdf.as_posix())
+    out = fitz.open()
+    tmp_dir = Path(tempfile.mkdtemp(prefix="searchable_pdf_"))
+
+    try:
+        for page_index, page in enumerate(src):
+            page_text = page.get_text("text").strip()
+            if page_text:
+                out.insert_pdf(src, from_page=page_index, to_page=page_index)
+                continue
+
+            img_path = tmp_dir / f"page_{page_index + 1:04d}.png"
+            ocr_pdf_path = tmp_dir / f"page_{page_index + 1:04d}.pdf"
+
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            pix.save(img_path.as_posix())
+
+            _run(["tesseract", img_path.as_posix(), ocr_pdf_path.with_suffix("").as_posix(), "pdf"])
+
+            if not ocr_pdf_path.exists():
+                raise RuntimeError(f"Tesseract did not produce expected PDF for page {page_index + 1}")
+
+            ocr_page_doc = fitz.open(ocr_pdf_path.as_posix())
+            out.insert_pdf(ocr_page_doc)
+            ocr_page_doc.close()
+
+        out.save(output_pdf.as_posix(), garbage=3, deflate=True)
+    finally:
+        src.close()
+        out.close()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _set_pdf_metadata(pdf_in: Path, pdf_out: Path, title: str, language: str) -> None:
-    with pikepdf.open(pdf_in.as_posix(), allow_overwriting_input=False) as pdf:
-        pdf.docinfo["/Title"] = title
+    doc = fitz.open(pdf_in.as_posix())
+    metadata = doc.metadata or {}
+    metadata["title"] = title
+    doc.set_metadata(metadata)
 
-        root = pdf.Root
-        root["/Lang"] = pikepdf.String(language)
+    catalog_xref = doc.pdf_catalog()
+    doc.xref_set_key(catalog_xref, "Lang", f"({language})")
+    doc.xref_set_key(catalog_xref, "ViewerPreferences", "<< /DisplayDocTitle true >>")
+    doc.xref_set_key(catalog_xref, "MarkInfo", "<< /Marked true >>")
 
-        viewer_prefs = root.get("/ViewerPreferences", pikepdf.Dictionary())
-        viewer_prefs["/DisplayDocTitle"] = True
-        root["/ViewerPreferences"] = viewer_prefs
-
-        markinfo = root.get("/MarkInfo", pikepdf.Dictionary())
-        markinfo["/Marked"] = True
-        root["/MarkInfo"] = markinfo
-
-        pdf.save(pdf_out.as_posix())
+    doc.save(pdf_out.as_posix(), garbage=3, deflate=True)
+    doc.close()
 
 
 def _render_pages(pdf_path: Path, pages_dir: Path) -> List[Path]:
@@ -323,7 +341,7 @@ def _write_report(
         "alt_text_manifest": manifest_path.as_posix(),
         "backends": {"ocr_backend": ocr_backend, "alt_backend": alt_backend},
         "checks": {
-            "searchable_text": "Applied with OCRmyPDF --skip-text (scanned + mixed + text-like support).",
+            "searchable_text": "Applied with PyMuPDF + Tesseract fallback for non-text pages.",
             "document_language": "Set in PDF catalog /Lang.",
             "document_title": "Set in /Title and display-title preference.",
             "alternative_text": "Generated for each embedded image.",
