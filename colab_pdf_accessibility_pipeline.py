@@ -61,6 +61,14 @@ def _load_local_deepseek_ocr_model(model_name: str = DEEPSEEK_OCR_MODEL_NAME):
     Lazy-load local HF DeepSeek OCR model.
     Matches user's sample approach and keeps it optional.
     """
+    try:
+        import addict  # type: ignore # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            "Local DeepSeek OCR requires the 'addict' package. "
+            "Install it with: pip install addict"
+        ) from exc
+
     from transformers import AutoModel, AutoTokenizer
     import torch
 
@@ -297,14 +305,14 @@ def _add_minimal_structure_tags(
             root.MarkInfo = pikepdf.Dictionary()
         root.MarkInfo.Marked = True
 
-        parent_tree = pdf.make_indirect(pikepdf.Dictionary({"Nums": pikepdf.Array()}))
+        parent_tree = pdf.make_indirect(pikepdf.Dictionary({"/Nums": pikepdf.Array()}))
 
         doc_struct_elem = pdf.make_indirect(
             pikepdf.Dictionary(
                 {
-                    "Type": pikepdf.Name("/StructElem"),
-                    "S": pikepdf.Name("/Document"),
-                    "K": pikepdf.Array(),
+                    "/Type": pikepdf.Name("/StructElem"),
+                    "/S": pikepdf.Name("/Document"),
+                    "/K": pikepdf.Array(),
                 }
             )
         )
@@ -314,11 +322,11 @@ def _add_minimal_structure_tags(
             page_container = pdf.make_indirect(
                 pikepdf.Dictionary(
                     {
-                        "Type": pikepdf.Name("/StructElem"),
-                        "S": pikepdf.Name("/Sect"),
-                        "P": doc_struct_elem,
-                        "Pg": page.obj,
-                        "K": pikepdf.Array(),
+                        "/Type": pikepdf.Name("/StructElem"),
+                        "/S": pikepdf.Name("/Sect"),
+                        "/P": doc_struct_elem,
+                        "/Pg": page.obj,
+                        "/K": pikepdf.Array(),
                     }
                 )
             )
@@ -334,11 +342,11 @@ def _add_minimal_structure_tags(
                         pdf.make_indirect(
                             pikepdf.Dictionary(
                                 {
-                                    "Type": pikepdf.Name("/StructElem"),
-                                    "S": pikepdf.Name(f"/{tag}"),
-                                    "P": page_container,
-                                    "Pg": page.obj,
-                                    "K": pikepdf.Array(),
+                                    "/Type": pikepdf.Name("/StructElem"),
+                                    "/S": pikepdf.Name(f"/{tag}"),
+                                    "/P": page_container,
+                                    "/Pg": page.obj,
+                                    "/K": pikepdf.Array(),
                                 }
                             )
                         )
@@ -352,10 +360,10 @@ def _add_minimal_structure_tags(
         struct_tree_root = pdf.make_indirect(
             pikepdf.Dictionary(
                 {
-                    "Type": pikepdf.Name("/StructTreeRoot"),
-                    "K": pikepdf.Array([doc_struct_elem]),
-                    "ParentTree": parent_tree,
-                    "ParentTreeNextKey": 0,
+                    "/Type": pikepdf.Name("/StructTreeRoot"),
+                    "/K": pikepdf.Array([doc_struct_elem]),
+                    "/ParentTree": parent_tree,
+                    "/ParentTreeNextKey": 0,
                 }
             )
         )
