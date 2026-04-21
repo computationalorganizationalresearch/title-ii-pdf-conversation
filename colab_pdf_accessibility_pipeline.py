@@ -917,9 +917,14 @@ def _qpdf_check(pdf_path: Path) -> Dict[str, object]:
 
 def _enforce_page_contrast(pdf_in: Path, pdf_out: Path) -> None:
     """
-    Increase page contrast to avoid white/light text blending into light-gray
-    backgrounds after conversion. This performs a raster pass per page and
-    darkens near-white foreground pixels when they appear on light-gray context.
+    Improve readability after conversion with a gentle tonal remap.
+
+    Previous logic attempted neighborhood-based edge detection for near-white
+    text, but that can produce dark outlines/halos around glyph antialiasing.
+    This version applies a smooth global highlight compression:
+      - preserve dark and mid-tone pixels,
+      - softly darken only bright highlight values.
+    The result keeps text legible without creating edge artifacts.
     """
     src = fitz.open(pdf_in.as_posix())
     out = fitz.open()
@@ -937,30 +942,29 @@ def _enforce_page_contrast(pdf_in: Path, pdf_out: Path) -> None:
                 continue
 
             adjusted = bytearray(data)
-            for y in range(1, height - 1):
+            # Only compress highlights so we do not alter text edges differently
+            # than nearby antialiased pixels.
+            highlight_start = 205
+            highlight_span = 50  # maps 205..255 into a compressed range
+            max_darkening = 32   # darkest change for pure white
+            for y in range(height):
                 row = y * stride
-                for x in range(1, width - 1):
+                for x in range(width):
                     i = row + (x * channels)
                     r, g, b = data[i], data[i + 1], data[i + 2]
-                    if min(r, g, b) < 240:
+                    luma = int(0.2126 * r + 0.7152 * g + 0.0722 * b)
+                    if luma <= highlight_start:
                         continue
 
-                    neighbor_lumas = []
-                    for dy in (-1, 0, 1):
-                        nrow = (y + dy) * stride
-                        for dx in (-1, 0, 1):
-                            if dx == 0 and dy == 0:
-                                continue
-                            ni = nrow + ((x + dx) * channels)
-                            nr, ng, nb = data[ni], data[ni + 1], data[ni + 2]
-                            luma = int(0.2126 * nr + 0.7152 * ng + 0.0722 * nb)
-                            neighbor_lumas.append(luma)
-
-                    avg_neighbor = sum(neighbor_lumas) / len(neighbor_lumas)
-                    if 175 <= avg_neighbor <= 240:
-                        adjusted[i] = 24
-                        adjusted[i + 1] = 24
-                        adjusted[i + 2] = 24
+                    t = (luma - highlight_start) / highlight_span
+                    if t > 1.0:
+                        t = 1.0
+                    # Smoothstep for softer transition.
+                    t = t * t * (3.0 - 2.0 * t)
+                    darken = int(max_darkening * t)
+                    adjusted[i] = max(0, r - darken)
+                    adjusted[i + 1] = max(0, g - darken)
+                    adjusted[i + 2] = max(0, b - darken)
 
             adjusted_pix = fitz.Pixmap(fitz.csRGB, width, height, bytes(adjusted), False)
             out_page = out.new_page(width=rect.width, height=rect.height)
