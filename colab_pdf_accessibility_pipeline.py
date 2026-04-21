@@ -208,9 +208,12 @@ def _deepseek_alt_text_api(image_path: Path) -> str:
                     {
                         "type": "text",
                         "text": (
-                            "Write one-sentence alt text for accessibility. "
-                            "Mention only meaningful visual information. "
-                            "If decorative, return exactly: Decorative image"
+                            "Create alt text for a blind reader. Describe only meaningful visual content "
+                            "using plain language. Include the main subject, setting, visible text, "
+                            "counts/relationships, and actions relevant to the document context. "
+                            "Avoid generic phrases like 'image of'. Keep it specific and concise "
+                            "(1-2 sentences, max 55 words). If decorative or redundant, return exactly: "
+                            "Decorative image"
                         ),
                     },
                     {"type": "image_url", "image_url": {"url": _data_url(image_path)}},
@@ -853,7 +856,13 @@ def _generate_alt_text_for_image(image_path: Path, alt_backend: str = "local_hf"
     if alt_backend == "local_hf":
         try:
             tokenizer, model = _load_local_deepseek_ocr_model()
-            prompt = "<image>\nDescribe this image for accessibility alt text in one sentence."
+            prompt = (
+                "<image>\nWrite specific alt text for a blind reader. Describe only meaningful visual "
+                "information: primary subject, setting, visible text, quantities/relationships, and key "
+                "actions relevant to document understanding. Avoid boilerplate like 'image of'. Keep to "
+                "1-2 concise sentences (max 55 words). If the image is purely decorative or duplicates "
+                "nearby text, return exactly: Decorative image."
+            )
             res = model.infer(
                 tokenizer,
                 prompt=prompt,
@@ -904,6 +913,63 @@ def _qpdf_check(pdf_path: Path) -> Dict[str, object]:
         "stdout": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
     }
+
+
+def _enforce_page_contrast(pdf_in: Path, pdf_out: Path) -> None:
+    """
+    Increase page contrast to avoid white/light text blending into light-gray
+    backgrounds after conversion. This performs a raster pass per page and
+    darkens near-white foreground pixels when they appear on light-gray context.
+    """
+    src = fitz.open(pdf_in.as_posix())
+    out = fitz.open()
+    try:
+        for page in src:
+            rect = page.rect
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            data = bytearray(pix.samples)
+            width, height = pix.width, pix.height
+            channels = pix.n
+            stride = pix.stride
+            if channels < 3:
+                out_page = out.new_page(width=rect.width, height=rect.height)
+                out_page.insert_image(out_page.rect, pixmap=pix)
+                continue
+
+            adjusted = bytearray(data)
+            for y in range(1, height - 1):
+                row = y * stride
+                for x in range(1, width - 1):
+                    i = row + (x * channels)
+                    r, g, b = data[i], data[i + 1], data[i + 2]
+                    if min(r, g, b) < 240:
+                        continue
+
+                    neighbor_lumas = []
+                    for dy in (-1, 0, 1):
+                        nrow = (y + dy) * stride
+                        for dx in (-1, 0, 1):
+                            if dx == 0 and dy == 0:
+                                continue
+                            ni = nrow + ((x + dx) * channels)
+                            nr, ng, nb = data[ni], data[ni + 1], data[ni + 2]
+                            luma = int(0.2126 * nr + 0.7152 * ng + 0.0722 * nb)
+                            neighbor_lumas.append(luma)
+
+                    avg_neighbor = sum(neighbor_lumas) / len(neighbor_lumas)
+                    if 175 <= avg_neighbor <= 240:
+                        adjusted[i] = 24
+                        adjusted[i + 1] = 24
+                        adjusted[i + 2] = 24
+
+            adjusted_pix = fitz.Pixmap(fitz.csRGB, width, height, bytes(adjusted), False)
+            out_page = out.new_page(width=rect.width, height=rect.height)
+            out_page.insert_image(out_page.rect, pixmap=adjusted_pix)
+
+        out.save(pdf_out.as_posix(), garbage=3, deflate=True)
+    finally:
+        src.close()
+        out.close()
 
 
 def _write_report(
@@ -994,6 +1060,7 @@ def convert_pdf(
     work_dir.mkdir(parents=True, exist_ok=True)
 
     ocr_pdf = work_dir / "01_searchable.pdf"
+    contrast_pdf = work_dir / "00_contrast_adjusted.pdf"
     meta_pdf = work_dir / "02_with_metadata.pdf"
     headed_pdf = work_dir / "03_with_headings.pdf"
     tagged_pdf = work_dir / "04_tagged.pdf"
@@ -1006,14 +1073,17 @@ def convert_pdf(
         except Exception as exc:
             print(f"[DeepSeek OCR] warmup failed: {exc}")
 
-    # 1) Searchable PDF (best visual fidelity for scanned and text-like docs)
-    _build_searchable_pdf(src, ocr_pdf)
+    # 1) Contrast remediation pass to avoid white text on light-gray backgrounds.
+    _enforce_page_contrast(src, contrast_pdf)
 
-    # 2) Document metadata
+    # 2) Searchable PDF (best visual fidelity for scanned and text-like docs)
+    _build_searchable_pdf(contrast_pdf, ocr_pdf)
+
+    # 3) Document metadata
     resolved_title = title if title else src.stem
     _set_pdf_metadata(ocr_pdf, meta_pdf, resolved_title, language)
 
-    # 3) OCR page text extraction (used for sidecar + LLM tag guesses)
+    # 4) OCR page text extraction (used for sidecar + LLM tag guesses)
     page_images = _render_pages(meta_pdf, pages_dir)
     page_texts = _collect_page_ocr_texts(page_images, work_dir / "ocr_outputs", ocr_backend=ocr_backend)
     # 4) Build robust inference text per page. If OCR failed on a page, use native PDF text.
