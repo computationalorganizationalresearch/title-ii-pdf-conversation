@@ -31,6 +31,7 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_VISION_MODEL = os.getenv("DEEPSEEK_VISION_MODEL", "deepseek-vl2")
 DEEPSEEK_OCR_MODEL_NAME = os.getenv("DEEPSEEK_OCR_MODEL_NAME", "deepseek-ai/DeepSeek-OCR")
 DEEPSEEK_OCR_REVISION = os.getenv("DEEPSEEK_OCR_REVISION")
+LOCAL_LLM_SPEED_MODE = os.getenv("LOCAL_LLM_SPEED_MODE", "balanced").strip().lower()
 
 
 # ---------------------------
@@ -174,22 +175,47 @@ def _warmup_local_deepseek_ocr_model(model_name: str = DEEPSEEK_OCR_MODEL_NAME) 
 
 def _local_deepseek_ocr_markdown(image_path: Path, output_dir: Path) -> str:
     """Run local HF DeepSeek OCR and return markdown-like result text."""
+    import torch
+
     tokenizer, model = _load_local_deepseek_ocr_model()
     prompt = "<image>\n<|grounding|>Convert the document to markdown. "
     output_dir.mkdir(parents=True, exist_ok=True)
+    infer_kwargs = _local_llm_infer_options(save_results_dir=output_dir)
 
-    res = model.infer(
-        tokenizer,
-        prompt=prompt,
-        image_file=image_path.as_posix(),
-        output_path=output_dir.as_posix(),
-        base_size=1024,
-        image_size=640,
-        crop_mode=True,
-        save_results=True,
-        test_compress=True,
-    )
+    with torch.inference_mode():
+        res = model.infer(
+            tokenizer,
+            prompt=prompt,
+            image_file=image_path.as_posix(),
+            **infer_kwargs,
+        )
     return str(res)
+
+
+def _local_llm_infer_options(save_results_dir: Optional[Path]) -> Dict[str, object]:
+    """
+    Choose local model infer settings tuned for faster execution with minimal
+    quality loss. The speed mode can be overridden via LOCAL_LLM_SPEED_MODE:
+      - fast: lowest latency
+      - balanced (default): speed-up with small quality trade-off
+      - quality: preserve original higher-detail settings
+    """
+    mode = LOCAL_LLM_SPEED_MODE
+    if mode not in {"fast", "balanced", "quality"}:
+        mode = "balanced"
+
+    options: Dict[str, object] = {
+        "output_path": "." if save_results_dir is None else save_results_dir.as_posix(),
+        "save_results": False,
+        "test_compress": False,
+    }
+    if mode == "fast":
+        options.update({"base_size": 896, "image_size": 576, "crop_mode": False})
+    elif mode == "quality":
+        options.update({"base_size": 1024, "image_size": 640, "crop_mode": True})
+    else:
+        options.update({"base_size": 960, "image_size": 608, "crop_mode": True})
+    return options
 
 
 def _deepseek_alt_text_api(image_path: Path) -> str:
@@ -855,6 +881,8 @@ def _generate_alt_text_for_image(image_path: Path, alt_backend: str = "local_hf"
     """
     if alt_backend == "local_hf":
         try:
+            import torch
+
             tokenizer, model = _load_local_deepseek_ocr_model()
             prompt = (
                 "<image>\nWrite specific alt text for a blind reader. Describe only meaningful visual "
@@ -863,17 +891,14 @@ def _generate_alt_text_for_image(image_path: Path, alt_backend: str = "local_hf"
                 "1-2 concise sentences (max 55 words). If the image is purely decorative or duplicates "
                 "nearby text, return exactly: Decorative image."
             )
-            res = model.infer(
-                tokenizer,
-                prompt=prompt,
-                image_file=image_path.as_posix(),
-                output_path=".",
-                base_size=1024,
-                image_size=640,
-                crop_mode=True,
-                save_results=False,
-                test_compress=True,
-            )
+            infer_kwargs = _local_llm_infer_options(save_results_dir=None)
+            with torch.inference_mode():
+                res = model.infer(
+                    tokenizer,
+                    prompt=prompt,
+                    image_file=image_path.as_posix(),
+                    **infer_kwargs,
+                )
             txt = str(res).strip()
             if txt:
                 return txt
@@ -917,14 +942,11 @@ def _qpdf_check(pdf_path: Path) -> Dict[str, object]:
 
 def _enforce_page_contrast(pdf_in: Path, pdf_out: Path) -> None:
     """
-    Improve readability after conversion with a gentle tonal remap.
+    Improve readability after conversion with a gentle tonal remap while
+    preserving white page backgrounds.
 
-    Previous logic attempted neighborhood-based edge detection for near-white
-    text, but that can produce dark outlines/halos around glyph antialiasing.
-    This version applies a smooth global highlight compression:
-      - preserve dark and mid-tone pixels,
-      - softly darken only bright highlight values.
-    The result keeps text legible without creating edge artifacts.
+    We only darken bright (but not pure-white) pixels, so paper/background
+    regions remain white and text remains crisp without gray page wash.
     """
     src = fitz.open(pdf_in.as_posix())
     out = fitz.open()
@@ -942,23 +964,22 @@ def _enforce_page_contrast(pdf_in: Path, pdf_out: Path) -> None:
                 continue
 
             adjusted = bytearray(data)
-            # Only compress highlights so we do not alter text edges differently
-            # than nearby antialiased pixels.
-            highlight_start = 205
-            highlight_span = 50  # maps 205..255 into a compressed range
-            max_darkening = 32   # darkest change for pure white
+            # Darken only bright non-white values. Keeping near-255 untouched
+            # avoids turning the whole page background gray.
+            highlight_start = 210
+            white_protect_start = 248
+            highlight_span = white_protect_start - highlight_start
+            max_darkening = 18
             for y in range(height):
                 row = y * stride
                 for x in range(width):
                     i = row + (x * channels)
                     r, g, b = data[i], data[i + 1], data[i + 2]
                     luma = int(0.2126 * r + 0.7152 * g + 0.0722 * b)
-                    if luma <= highlight_start:
+                    if luma <= highlight_start or luma >= white_protect_start:
                         continue
 
                     t = (luma - highlight_start) / highlight_span
-                    if t > 1.0:
-                        t = 1.0
                     # Smoothstep for softer transition.
                     t = t * t * (3.0 - 2.0 * t)
                     darken = int(max_darkening * t)
