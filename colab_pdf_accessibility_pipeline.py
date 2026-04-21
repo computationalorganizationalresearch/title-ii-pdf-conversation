@@ -11,12 +11,15 @@ If unavailable, pipeline falls back gracefully.
 from __future__ import annotations
 
 import base64
+import contextlib
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -183,12 +186,15 @@ def _local_deepseek_ocr_markdown(image_path: Path, output_dir: Path) -> str:
     infer_kwargs = _local_llm_infer_options(save_results_dir=output_dir)
 
     with torch.inference_mode():
-        res = model.infer(
-            tokenizer,
-            prompt=prompt,
-            image_file=image_path.as_posix(),
-            **infer_kwargs,
-        )
+        # Suppress model-internal console output (large OCR text dumps and warnings)
+        # so pipeline logs stay concise and execution is not I/O-bound.
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            res = model.infer(
+                tokenizer,
+                prompt=prompt,
+                image_file=image_path.as_posix(),
+                **infer_kwargs,
+            )
     return str(res)
 
 
@@ -836,6 +842,8 @@ def _collect_page_ocr_texts(
     page_images: List[Path],
     ocr_output_dir: Path,
     ocr_backend: str = "local_hf",
+    native_page_texts: Optional[List[str]] = None,
+    skip_ocr_for_text_pages: bool = True,
 ) -> List[str]:
     """
     OCR markdown sidecar generation.
@@ -843,8 +851,31 @@ def _collect_page_ocr_texts(
     Fallback backend: none (placeholder lines).
     """
     texts: List[str] = []
+    total = len(page_images)
+    started = time.perf_counter()
+
+    def _render_progress(done: int) -> None:
+        width = 28
+        ratio = (done / total) if total else 1.0
+        filled = int(ratio * width)
+        bar = ("#" * filled).ljust(width, "-")
+        elapsed = time.perf_counter() - started
+        print(f"\rOCR Progress [{bar}] {done}/{total} ({ratio*100:5.1f}%) elapsed {elapsed:5.1f}s", end="", flush=True)
 
     for i, image_path in enumerate(page_images, start=1):
+        if (
+            skip_ocr_for_text_pages
+            and native_page_texts
+            and i - 1 < len(native_page_texts)
+            and native_page_texts[i - 1].strip()
+        ):
+            # Speed optimization: skip expensive vision OCR for pages that already
+            # contain extractable native text.
+            text = native_page_texts[i - 1].strip()
+            texts.append(text)
+            _render_progress(i)
+            continue
+
         if ocr_backend == "local_hf":
             try:
                 text = _local_deepseek_ocr_markdown(image_path, ocr_output_dir)
@@ -853,6 +884,10 @@ def _collect_page_ocr_texts(
         else:
             text = f"[OCR backend '{ocr_backend}' not implemented in this single-file mode.]"
         texts.append(text)
+        _render_progress(i)
+
+    if total:
+        print()
 
     return texts
 
@@ -893,12 +928,13 @@ def _generate_alt_text_for_image(image_path: Path, alt_backend: str = "local_hf"
             )
             infer_kwargs = _local_llm_infer_options(save_results_dir=None)
             with torch.inference_mode():
-                res = model.infer(
-                    tokenizer,
-                    prompt=prompt,
-                    image_file=image_path.as_posix(),
-                    **infer_kwargs,
-                )
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    res = model.infer(
+                        tokenizer,
+                        prompt=prompt,
+                        image_file=image_path.as_posix(),
+                        **infer_kwargs,
+                    )
             txt = str(res).strip()
             if txt:
                 return txt
@@ -1109,10 +1145,16 @@ def convert_pdf(
     _set_pdf_metadata(ocr_pdf, meta_pdf, resolved_title, language)
 
     # 4) OCR page text extraction (used for sidecar + LLM tag guesses)
-    page_images = _render_pages(meta_pdf, pages_dir)
-    page_texts = _collect_page_ocr_texts(page_images, work_dir / "ocr_outputs", ocr_backend=ocr_backend)
-    # 4) Build robust inference text per page. If OCR failed on a page, use native PDF text.
     native_page_texts = _extract_page_texts(meta_pdf)
+    page_images = _render_pages(meta_pdf, pages_dir)
+    page_texts = _collect_page_ocr_texts(
+        page_images,
+        work_dir / "ocr_outputs",
+        ocr_backend=ocr_backend,
+        native_page_texts=native_page_texts,
+        skip_ocr_for_text_pages=True,
+    )
+    # 4) Build robust inference text per page. If OCR failed on a page, use native PDF text.
     inference_texts = _merge_inference_texts(page_texts, native_page_texts)
 
     # 4b) Infer headings per page (used for both structure tags and bookmarks/TOC).
